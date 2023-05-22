@@ -1,0 +1,203 @@
+                      +-------------------------+
+                      |         EE 461S         |
+                      | PROJECT 4: FILE SYSTEMS |
+                      |      DESIGN DOCUMENT    |
+                      +-------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Keshav Narasimhan <keshavnarasimhan@utexas.edu>
+Pranav Swaminathan <pranavswaminathan@utexas.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+For extra credit, we built our project off of VM rather than building simply off of Userprog.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+                     INDEXED AND EXTENSIBLE FILES
+                     ============================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+This struct is the on disk inode information, and it is exactly 128 bytes long. It contains the information regarding the direct and indirect pointers.
+/* On-disk inode.
+ * Must be exactly BLOCK_SECTOR_SIZE bytes long. */
+struct inode_disk {
+    block_sector_t start;       /* First data sector. */
+    off_t          length;      /* File size in bytes. */
+    unsigned       magic;       /* Magic number. */
+    // uint32_t       unused[125]; /* Not used. */
+
+    /* pointers */
+    block_sector_t direct_pointers[121];
+    block_sector_t single_indirect_pointer;
+    block_sector_t double_indirect_pointer;
+
+    /* directory or file? */
+    bool is_a_directory;
+    block_sector_t p;
+};
+
+This struct is the on memory inode information. It has access to the data above, as well as the sector number and other information.
+/* In-memory inode. */
+struct inode {
+    struct list_elem  elem;           /* Element in inode list. */
+    block_sector_t    sector;         /* Sector number of disk location. */
+    int               open_cnt;       /* Number of openers. */
+    bool              removed;        /* True if deleted, false otherwise. */
+    int               deny_write_cnt; /* 0: writes ok, >0: deny writes. */
+    struct inode_disk data;           /* Inode content. */
+};
+
+>> A2: What is the maximum size of a file supported by your inode
+>> structure?  Show your work.
+
+121 direct sectors * 512 bytes = 61952 bytes
+
+1 single indirect sector * 121 direct sectors * 512 bytes = 61952 bytes
+
+1 double indirect sector * 121 indirect sectors * 61952 bytes per indirect sector = 7496192 bytes
+
+Total: 7620096
+
+---- RATIONALE ----
+
+>> A6: Is your inode structure a multilevel index?  If so, why did you
+>> choose this particular combination of direct, indirect, and doubly
+>> indirect blocks?  If not, why did you choose an alternative inode
+>> structure, and what advantages and disadvantages does your
+>> structure have, compared to a multilevel index?
+
+Our implementation of the inode is a multilevel structure. This is because we have direct pointers, singly indirect pointers, as well as doubly
+indirect pointers in our inode_disk structure. We simply chose this combination so that we would have as many direct blocks as possible, and enough
+indirect blocks in order to obtain the file size that would work for most of the large files that we would need to handle in this project. One disadvantage
+with our current setup is that it does not cover the maximum file size Pintos tests, since we do not account for file sizes of up to 8 MB. However, we 
+are able to handle almost all other file sizes, and the block pointer set up allows us to easily extend file sizes. One improvement that we could make
+is we could take into account what is the median file size of Pintos files and try to set up our blocks in such a way to efficiently handle these median
+sizes in as easy a way as possible. 
+
+                            SUBDIRECTORIES
+                            ==============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+The first struct is our implementation of a directory that sits in memory, and each of these struct is supported by the corresponding inode
+/* A directory. */
+struct dir {
+    struct inode *inode; /* Backing store. */
+    off_t         pos;   /* Current position. */
+};
+
+The second struct is used to represent a single directory entry, and it includes fields such as the inode sector and its name. Additionally, the in_use 
+attribute determiens whether the entry is in use or a free entry (if it is in use, then it'll hold its inode sector)
+/* A single directory entry. */
+struct dir_entry {
+    block_sector_t inode_sector;       /* Sector number of header. */
+    char           name[NAME_MAX + 1]; /* Null terminated file name. */
+    bool           in_use;             /* In use or free? */
+};
+
+We keep track of the current working directory of each thread in the thread struct, and it is kept as a struct dir pointer.
+struct thread {
+    /* Owned by thread.c. */
+    tid_t              tid;      /* Thread identifier. */
+    enum thread_status status;   /* Thread state. */
+    char               name[16]; /* Name (for debugging purposes). */
+    uint8_t           *stack;    /* Saved stack pointer. */
+    int                priority; /* Priority. */
+    struct list_elem   allelem;  /* List element for all threads list. */
+
+    /* Shared between thread.c and synch.c. */
+    struct list_elem elem; /* List element. */
+
+#ifdef USERPROG
+    /* Owned by userprog/process.c. */
+    uint32_t *pagedir;                  /* Page directory. */
+    int exitStatus;                     /* exit status */
+    // struct file *fdtab[25];
+    struct list fdtab;                  /* file descriptor table */
+    int next_fd;                        /* index of next fd */
+    struct file *executable;            /* executable file */
+    tid_t parent_tid;                   /* reference to this thread's parent */
+    struct semaphore launched;          /* semaphore for launching */
+    struct semaphore exit;              /* semaphore used to reap exit status of child in process_wait() */
+    struct semaphore avoid_exit_errs;   /* semaphore used to allow parent to get the exit status of child in process_wait() */
+#endif
+
+    struct hash spt;                    /* Supplemental Page Table implemented as a HashTable */
+    struct lock spt_lock;               /* lock for accessing the SPT */
+    uint32_t *user_esp;                  /* user stack pointer */
+    bool loaded;                        /* has the executable been loaded */
+
+    struct dir *current_working_directory;      /* thread's current working directory */
+
+    /* Owned by thread.c. */
+    unsigned magic; /* Detects stack overflow. */
+};
+
+---- ALGORITHMS ----
+
+>> B2: Describe your code for traversing a user-specified path.  How
+>> do traversals of absolute and relative paths differ?
+
+We determine which path we need to traverse from the specified path by identifying the first character of the path. This enables us to to determine
+whether the path we need for traversals is a relative path or an absolute path. More specifically, if the first character of the path is a "/", then we
+know that the path we need to worry about starts from the root (absolute). Whereas, in the case where this character doesn't preceed the rest of the path,
+we know that the path specified is a relative path, and thus we start from the thread's current working directory.
+
+After we know where to start from, we use strtok_r() to parse the specified path by delimiting the tokens with each "/" character. Each token we parse, we
+update the thread's current working directory. We continue until we reach the end of the path, at which point strtok_r() will return a NULL character. Thus,
+at this point, we know which directory we ended up at, and we will then return this directory to be used.
+
+---- RATIONALE ----
+
+>> B6: Explain why you chose to represent the current directory of a
+>> process the way you did.
+
+We decided to keep track of the current working directory of a process in its struct thread to enable easy access to this attribute at all times. We
+decided to keep track of the current_working_directory field as a struct dir pointer as we felt this would be the easiest implementation to keep track of 
+the directory (since this is the struct for a directory), rather than keep track of the path. This enables us to easily transition on thread creation, as 
+child threads will either keep the root directory or its parent's current working directory as its current_working_directory when created. This also enables
+us to easilly utilize the methods in directory.c to open the directory when needed, as we can easily pass the cwd to the method. Additionally, when we 
+change directories for a given thread, keeping track of the directory pointer saves a lot of time and effort compared to keeping track of the path name
+when it comes to opening and closing the respective inodes as we can easily make use of the inode methods. 
+
+                           SURVEY QUESTIONS
+                           ================
+
+Answering these questions is optional, but it will help us improve the
+course in future semesters.  Feel free to tell us anything you
+want -- these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the semester.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future semesters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students in future semesters?
+
+>> Any other comments?
